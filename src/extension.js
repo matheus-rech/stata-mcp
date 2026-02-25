@@ -1010,35 +1010,15 @@ async function runInteractive() {
         console.log('[runInteractive] Using full file:', filePath);
     }
 
-    // Open the interactive webpage in the system's default browser
-    // Using direct system commands to bypass VS Code's Simple Browser
-    const url = `http://${host}:${port}/interactive?${urlParams}`;
-    console.log('[runInteractive] Opening URL in system browser:', url);
+    // Open the interactive webpage in the browser
+    // Use asExternalUri for remote environment compatibility (code-server, Remote-SSH)
+    const localUrl = vscode.Uri.parse(`http://${host}:${port}/interactive?${urlParams}`);
+    console.log('[runInteractive] Opening URL:', localUrl.toString());
 
     try {
-        let openCommand;
-        if (IS_MAC) {
-            // macOS: use 'open' command with proper URL escaping
-            // Single quotes prevent shell interpretation of special chars
-            openCommand = `open '${url.replace(/'/g, "'\\''")}'`;
-        } else if (IS_WINDOWS) {
-            // Windows: use 'start' command
-            openCommand = `start "" "${url}"`;
-        } else {
-            // Linux: use 'xdg-open' command
-            openCommand = `xdg-open '${url.replace(/'/g, "'\\''")}'`;
-        }
-
-        console.log('[runInteractive] Executing command:', openCommand);
-        exec(openCommand, (error) => {
-            if (error) {
-                console.error('[runInteractive] Error opening browser:', error);
-                vscode.window.showErrorMessage(`Failed to open browser: ${error.message}`);
-            } else {
-                console.log('[runInteractive] Browser opened successfully');
-            }
-        });
-
+        const externalUri = await vscode.env.asExternalUri(localUrl);
+        console.log('[runInteractive] External URI:', externalUri.toString());
+        await vscode.env.openExternal(externalUri);
         vscode.window.showInformationMessage('Stata Interactive Window opened in your browser!');
     } catch (error) {
         console.error('[runInteractive] Error:', error);
@@ -1056,7 +1036,7 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
-                localResourceRoots: []
+                localResourceRoots: [vscode.Uri.file(getGraphsDir())]
             }
         );
 
@@ -1103,7 +1083,7 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
                                     result: result,
                                     graphs: cmdGraphs.map(g => ({
                                         name: g.name,
-                                        url: `http://${cmdHost}:${cmdPort}/graphs/${encodeURIComponent(g.name)}`
+                                        url: getGraphWebviewUri(interactivePanel.webview, g)
                                     }))
                                 });
                             } else {
@@ -1132,7 +1112,7 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
     // Generate HTML content
     const fileName = path.basename(filePath);
     const graphsHtml = graphs.map(graph => {
-        const graphUrl = `http://${host}:${port}/graphs/${encodeURIComponent(graph.name)}`;
+        const graphUrl = getGraphWebviewUri(interactivePanel.webview, graph);
         return `
             <div class="graph-container">
                 <h3>${graph.name}</h3>
@@ -1143,16 +1123,17 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
         `;
     }).join('');
 
-    interactivePanel.webview.html = getInteractiveWindowHtml(fileName, output, graphsHtml);
+    const cspSource = interactivePanel.webview.cspSource;
+    interactivePanel.webview.html = getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource);
 }
 
-function getInteractiveWindowHtml(fileName, output, graphsHtml) {
+function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src http://localhost:* http://127.0.0.1:* https://*; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Stata Interactive Window</title>
     <style>
         body {
@@ -1427,7 +1408,7 @@ async function executeStataCode(code, toolName = 'run_command', workingDir = nul
     if (toolName === 'run_selection') {
         allGraphs = {};
         if (graphViewerPanel) {
-            updateGraphViewerPanel(host, port);
+            updateGraphViewerPanel();
         }
     }
 
@@ -2783,6 +2764,24 @@ function parseGraphsFromOutput(output) {
 let graphViewerPanel = null;
 let allGraphs = {}; // Store all graphs by name to accumulate them
 
+function getGraphsDir() {
+    const extensionPath = globalContext.extensionPath || __dirname;
+    return path.join(extensionPath, 'graphs');
+}
+
+function getGraphWebviewUri(webview, graph) {
+    // Convert a graph's disk path to a webview-compatible URI.
+    // This works in all environments: local, Remote-SSH, code-server, Codespaces.
+    if (graph.path) {
+        // Normalize forward slashes back to OS path separators
+        const normalizedPath = graph.path.replace(/\//g, path.sep);
+        return webview.asWebviewUri(vscode.Uri.file(normalizedPath)).toString();
+    }
+    // Fallback: construct path from graphs directory + name
+    const graphFile = path.join(getGraphsDir(), `${graph.name}.png`);
+    return webview.asWebviewUri(vscode.Uri.file(graphFile)).toString();
+}
+
 async function displayGraphs(graphs, host, port) {
     if (!graphs || graphs.length === 0) {
         return;
@@ -2810,7 +2809,8 @@ function displayGraphsInVSCode(graphs, host, port) {
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
-                enableCommandUris: true
+                enableCommandUris: true,
+                localResourceRoots: [vscode.Uri.file(getGraphsDir())]
             }
         );
 
@@ -2828,7 +2828,7 @@ function displayGraphsInVSCode(graphs, host, port) {
             message => {
                 if (message.command === 'clearGraphs') {
                     allGraphs = {};
-                    updateGraphViewerPanel(host, port);
+                    updateGraphViewerPanel();
                 }
             },
             undefined,
@@ -2846,13 +2846,13 @@ function displayGraphsInVSCode(graphs, host, port) {
         };
     });
 
-    updateGraphViewerPanel(host, port);
+    updateGraphViewerPanel();
     graphViewerPanel.reveal(vscode.ViewColumn.Beside);
 
     Logger.info(`Displayed ${graphs.length} graph(s) in VS Code webview (total: ${Object.keys(allGraphs).length})`);
 }
 
-function updateGraphViewerPanel(host, port) {
+function updateGraphViewerPanel() {
     if (!graphViewerPanel) return;
 
     // Display: last graph at top (duplicated), then all graphs in order
@@ -2884,9 +2884,9 @@ function updateGraphViewerPanel(host, port) {
         }
     }
 
-    // Generate HTML for graphs with timestamps to force reload
+    // Generate HTML for graphs using webview URIs (works in remote environments)
     const graphsHtml = graphsArray.map(graph => {
-        const graphUrl = `http://${host}:${port}/graphs/${encodeURIComponent(graph.name)}?t=${graph.timestamp}`;
+        const graphUrl = getGraphWebviewUri(graphViewerPanel.webview, graph);
         const displayName = graph.displayName || graph.name;
         return `
             <div class="graph-container" data-graph-name="${escapeHtml(graph.name)}">
@@ -2898,48 +2898,31 @@ function updateGraphViewerPanel(host, port) {
         `;
     }).join('');
 
-    graphViewerPanel.webview.html = getGraphViewerHtml(graphsHtml, graphsArray.length);
+    const cspSource = graphViewerPanel.webview.cspSource;
+    graphViewerPanel.webview.html = getGraphViewerHtml(graphsHtml, graphsArray.length, cspSource);
 }
 
-function displayGraphsInBrowser(graphs, host, port) {
+async function displayGraphsInBrowser(graphs, host, port) {
     for (const graph of graphs) {
         try {
-            // Open each graph in external browser
-            const graphUrl = `http://${host}:${port}/graphs/${encodeURIComponent(graph.name)}`;
-            console.log(`[displayGraphs] Opening graph in system browser: ${graphUrl}`);
-
-            let openCommand;
-            if (IS_MAC) {
-                openCommand = `open '${graphUrl.replace(/'/g, "'\\''")}'`;
-            } else if (IS_WINDOWS) {
-                openCommand = `start "" "${graphUrl}"`;
-            } else {
-                openCommand = `xdg-open '${graphUrl.replace(/'/g, "'\\''")}'`;
-            }
-
-            exec(openCommand, (error) => {
-                if (error) {
-                    console.error('[displayGraphs] Error opening browser:', error);
-                    vscode.window.showErrorMessage(`Failed to open graph ${graph.name}: ${error.message}`);
-                } else {
-                    console.log(`[displayGraphs] Graph ${graph.name} opened successfully`);
-                }
-            });
-
-            Logger.info(`Opened graph in external browser: ${graph.name}`);
+            // Use asExternalUri to get a URL that works in remote environments
+            const localUrl = vscode.Uri.parse(`http://${host}:${port}/graphs/${encodeURIComponent(graph.name)}`);
+            const externalUri = await vscode.env.asExternalUri(localUrl);
+            Logger.info(`Opening graph in external browser: ${externalUri.toString()}`);
+            await vscode.env.openExternal(externalUri);
         } catch (error) {
             Logger.error(`Error displaying graph ${graph.name}: ${error.message}`);
         }
     }
 }
 
-function getGraphViewerHtml(graphsHtml, graphCount) {
+function getGraphViewerHtml(graphsHtml, graphCount, cspSource) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src http://localhost:* http://127.0.0.1:* https://*; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Stata Graphs</title>
     <style>
         body {
