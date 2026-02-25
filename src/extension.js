@@ -1036,7 +1036,10 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
-                localResourceRoots: [vscode.Uri.file(getGraphsDir())]
+                localResourceRoots: [
+                    vscode.Uri.file(getGraphsDir()),
+                    vscode.Uri.file(path.join(os.tmpdir(), 'stata_mcp_graphs'))
+                ]
             }
         );
 
@@ -1051,11 +1054,13 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
                 switch (message.command) {
                     case 'runCommand':
                         if (isRestarting) {
-                            interactivePanel.webview.postMessage({
-                                command: 'output',
-                                text: 'Stata session is restarting. Please wait.',
-                                isError: true
-                            });
+                            if (interactivePanel) {
+                                interactivePanel.webview.postMessage({
+                                    command: 'output',
+                                    text: 'Stata session is restarting. Please wait.',
+                                    isError: true
+                                });
+                            }
                             break;
                         }
                         try {
@@ -1072,6 +1077,8 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
                                 },
                                 { headers: { 'Content-Type': 'application/json' }, timeout: cmdTimeout * 1000 }
                             );
+
+                            if (!interactivePanel) break; // Panel closed during request
 
                             if (response.status === 200 && response.data.status === 'success') {
                                 const result = response.data.result || 'Command executed';
@@ -1093,10 +1100,12 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
                                 });
                             }
                         } catch (error) {
-                            interactivePanel.webview.postMessage({
-                                command: 'error',
-                                text: error.message
-                            });
+                            if (interactivePanel) {
+                                interactivePanel.webview.postMessage({
+                                    command: 'error',
+                                    text: error.message
+                                });
+                            }
                         }
                         break;
                 }
@@ -1112,13 +1121,14 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
     // Generate HTML content
     const fileName = path.basename(filePath);
     const graphsHtml = graphs.map(graph => {
-        const graphUrl = getGraphWebviewUri(interactivePanel.webview, graph);
+        const graphUrl = escapeHtml(getGraphWebviewUri(interactivePanel.webview, graph));
+        const safeName = escapeHtml(graph.name);
         return `
             <div class="graph-container">
-                <h3>${graph.name}</h3>
-                <img src="${graphUrl}" alt="${graph.name}"
+                <h3>${safeName}</h3>
+                <img src="${graphUrl}" alt="${safeName}"
                      onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                <div class="error" style="display:none;">Failed to load graph: ${graph.name}</div>
+                <div class="error" style="display:none;">Failed to load graph: ${safeName}</div>
             </div>
         `;
     }).join('');
@@ -1265,7 +1275,7 @@ function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
 <body>
     <div class="header">
         <h1>📊 Stata Interactive Window</h1>
-        <div class="file-name">File: ${fileName}</div>
+        <div class="file-name">File: ${escapeHtml(fileName)}</div>
     </div>
 
     <div class="section">
@@ -1335,9 +1345,10 @@ function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
 
                 // Add graphs if any
                 if (message.graphs && message.graphs.length > 0) {
+                    const esc = (s) => s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;') : '';
                     const graphsHtml = message.graphs.map(g =>
-                        \`<div class="graph-container"><h3>\${g.name}</h3>
-                        <img src="\${g.url}" alt="\${g.name}"></div>\`).join('');
+                        \`<div class="graph-container"><h3>\${esc(g.name)}</h3>
+                        <img src="\${esc(g.url)}" alt="\${esc(g.name)}"></div>\`).join('');
                     graphsContainer.innerHTML += graphsHtml;
                 }
             } else if (message.command === 'error') {
@@ -2728,8 +2739,8 @@ function parseGraphsFromOutput(output) {
         Logger.debug(`Graph lines: ${JSON.stringify(graphLines)}`);
 
         for (const line of graphLines) {
-            // Extract graph name and path from lines like "  • graph1: /path/to/graph.png"
-            const graphMatch = line.match(/•\s+(.+):\s+(.+)/);
+            // Extract graph name and path from lines like "  • graph1: /path/to/graph.png" or "  • graph1: /path/to/graph.png [CMD: ...]"
+            const graphMatch = line.match(/•\s+([^:]+):\s+([^\n\[]+?)(?:\s*\[CMD:.*\])?$/);
             if (graphMatch) {
                 const name = graphMatch[1].trim();
                 // Normalize path to forward slashes (Windows paths may have backslashes)
@@ -2810,7 +2821,10 @@ function displayGraphsInVSCode(graphs, host, port) {
                 enableScripts: true,
                 retainContextWhenHidden: true,
                 enableCommandUris: true,
-                localResourceRoots: [vscode.Uri.file(getGraphsDir())]
+                localResourceRoots: [
+                    vscode.Uri.file(getGraphsDir()),
+                    vscode.Uri.file(path.join(os.tmpdir(), 'stata_mcp_graphs'))
+                ]
             }
         );
 
@@ -2886,7 +2900,7 @@ function updateGraphViewerPanel() {
 
     // Generate HTML for graphs using webview URIs (works in remote environments)
     const graphsHtml = graphsArray.map(graph => {
-        const graphUrl = getGraphWebviewUri(graphViewerPanel.webview, graph);
+        const graphUrl = escapeHtml(getGraphWebviewUri(graphViewerPanel.webview, graph));
         const displayName = graph.displayName || graph.name;
         return `
             <div class="graph-container" data-graph-name="${escapeHtml(graph.name)}">

@@ -2,6 +2,16 @@
 
 All notable changes to the Stata MCP extension will be documented in this file.
 
+## [0.4.8] - 2026-02-24
+
+### Fixed
+- **Graphs Fail in Remote Environments**: Fixed graph display in code-server, Remote-SSH, and proxied environments (Issue #54)
+  - Replaced `http://localhost` URLs with `webview.asWebviewUri()` for loading graph images from disk
+  - Added proper `localResourceRoots` to webview panels for secure file access
+  - Updated Content Security Policy to use `webview.cspSource` instead of hardcoded localhost
+  - External browser graph display now uses `vscode.env.asExternalUri()` for correct URL resolution
+  - Works across local, remote, and tunneled VS Code environments
+
 ## [0.4.7] - 2026-02-14
 
 ### Added

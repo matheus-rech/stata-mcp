@@ -3405,6 +3405,18 @@ async def get_graph(graph_name: str):
             graph_name = f"{graph_name}.png"
 
         graph_path = os.path.join(graphs_dir, graph_name)
+
+        # Prevent path traversal attacks
+        real_graph_path = os.path.realpath(graph_path)
+        real_graphs_dir = os.path.realpath(graphs_dir)
+        if not real_graph_path.startswith(real_graphs_dir + os.sep) and real_graph_path != real_graphs_dir:
+            logging.warning(f"Path traversal attempt blocked: {graph_name}")
+            return Response(
+                content="Invalid graph name",
+                status_code=400,
+                media_type="text/plain"
+            )
+
         logging.debug(f"Looking for graph at: {graph_path}")
 
         # Check if file exists
