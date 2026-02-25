@@ -15,6 +15,10 @@ let mcpServerProcess;
 let mcpServerRunning = false;
 let agentWebviewPanel = null;
 let stataOutputWebviewPanel = null;
+let stataHelpPanel = null;
+let helpHistory = [];      // Array of {topic, marker} objects for back navigation
+let helpHistoryIndex = -1; // Current position in helpHistory
+let helpAbortController = null;  // AbortController for cancelling stale help requests
 let globalContext;
 let detectedStataPath = null;
 let debugMode = false;
@@ -1069,6 +1073,33 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
                             const cmdPort = config.get('mcpServerPort') || 4000;
                             const cmdTimeout = config.get('runSelectionTimeout') || 600;  // Default 600 seconds
 
+                            // Intercept help commands in interactive panel
+                            if (!message.text) break;
+                            const interactiveHelpTopic = parseHelpCommand(message.text);
+                            if (interactiveHelpTopic) {
+                                try {
+                                    await fetchAndShowHelp(interactiveHelpTopic, '', cmdHost, cmdPort);
+                                    if (interactivePanel) {
+                                        interactivePanel.webview.postMessage({
+                                            command: 'commandResult',
+                                            executedCommand: message.text,
+                                            result: `Help displayed for: ${interactiveHelpTopic}`,
+                                            graphs: []
+                                        });
+                                    }
+                                } catch (helpError) {
+                                    if (interactivePanel) {
+                                        const rawErr = helpError.response && helpError.response.data ? helpError.response.data : helpError.message;
+                                        const errMsg = typeof rawErr === 'string' ? rawErr : JSON.stringify(rawErr);
+                                        interactivePanel.webview.postMessage({
+                                            command: 'error',
+                                            text: `Failed to load help: ${errMsg}`
+                                        });
+                                    }
+                                }
+                                break;
+                            }
+
                             const response = await axios.post(
                                 `http://${cmdHost}:${cmdPort}/v1/tools`,
                                 {
@@ -1381,6 +1412,171 @@ function escapeHtml(text) {
     return text.replace(/[&<>"']/g, m => map[m]);
 }
 
+/**
+ * Detect if a command is a Stata help command and extract the topic.
+ * Matches: help (and abbreviations h, he, hel), man, chelp (ch, che, chel), whelp (wh, whe, whel)
+ * Only single-line commands are intercepted; multiline code is not.
+ * Returns the sanitized topic string, or null if not a help command.
+ */
+function parseHelpCommand(code) {
+    const trimmed = code.trim();
+    // Multiline code should not be intercepted as help
+    if (trimmed.includes('\n')) return null;
+    // Match help/h/he/hel, man, chelp/ch/che/chel, whelp/wh/whe/whel followed by a topic
+    const match = trimmed.match(/^\s*(h(e(l(p)?)?)?|man|ch(e(l(p)?)?)?|wh(e(l(p)?)?)?)\s+(.+)$/i);
+    if (!match) return null;
+    let topic = match[11].trim();
+    // Strip options after comma (e.g., "regress, nonew" -> "regress")
+    topic = topic.replace(/,.*$/, '').trim();
+    // Strip leading # (e.g., "#delimit" -> "delimit")
+    topic = topic.replace(/^#/, '');
+    // Replace spaces with underscores (e.g., "regress postestimation" -> "regress_postestimation")
+    topic = topic.replace(/\s+/g, '_');
+    return topic || null;
+}
+
+/**
+ * Display Stata help content in a dedicated webview panel.
+ * Supports both plain text (fallback) and rich HTML from SMCL parser.
+ * @param {string} topic - The help topic name
+ * @param {string} content - HTML content from the server (format=html)
+ * @param {string} marker - Optional marker to scroll to after rendering
+ */
+function showStataHelp(topic, content, marker) {
+    if (!stataHelpPanel) {
+        stataHelpPanel = vscode.window.createWebviewPanel(
+            'stataHelp',
+            `Stata Help: ${topic}`,
+            vscode.ViewColumn.Beside,
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+
+        stataHelpPanel.onDidDispose(
+            () => {
+                stataHelpPanel = null;
+                helpHistory = [];
+                helpHistoryIndex = -1;
+            },
+            null,
+            globalContext.subscriptions
+        );
+
+        // Handle messages from the webview
+        stataHelpPanel.webview.onDidReceiveMessage(
+            async (message) => {
+                const config = getConfig();
+                const host = config.get('mcpServerHost') || 'localhost';
+                const port = config.get('mcpServerPort') || 4000;
+
+                switch (message.command) {
+                    case 'helpNavigate':
+                        // User clicked a help link — navigate to new topic
+                        await fetchAndShowHelp(message.topic, message.marker || '', host, port);
+                        break;
+                    case 'helpBack':
+                        if (helpHistoryIndex > 0) {
+                            helpHistoryIndex--;
+                            const prev = helpHistory[helpHistoryIndex];
+                            await fetchAndShowHelp(prev.topic, prev.marker, host, port, true);
+                        }
+                        break;
+                    case 'helpForward':
+                        if (helpHistoryIndex < helpHistory.length - 1) {
+                            helpHistoryIndex++;
+                            const next = helpHistory[helpHistoryIndex];
+                            await fetchAndShowHelp(next.topic, next.marker, host, port, true);
+                        }
+                        break;
+                    case 'openExternal':
+                        if (message.url) {
+                            vscode.env.openExternal(vscode.Uri.parse(message.url));
+                        }
+                        break;
+                }
+            },
+            null,
+            globalContext.subscriptions
+        );
+    } else {
+        stataHelpPanel.title = `Stata Help: ${topic}`;
+        stataHelpPanel.reveal();
+    }
+
+    // Set the HTML content (already a complete HTML document from the SMCL parser)
+    // Fallback to error page if content is empty
+    if (!content || !content.trim()) {
+        stataHelpPanel.webview.html = `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:24px;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background)"><p>No help content available for: <strong>${escapeHtml(topic)}</strong></p></body></html>`;
+    } else {
+        stataHelpPanel.webview.html = String(content);
+    }
+
+    // Scroll to marker if specified (after a small delay for DOM to render)
+    if (marker) {
+        setTimeout(() => {
+            if (stataHelpPanel) {
+                stataHelpPanel.webview.postMessage({ command: 'scrollToMarker', marker: marker });
+            }
+        }, 100);
+    }
+}
+
+/**
+ * Fetch help content from the server and display it in the help panel.
+ * Manages the help navigation history with a cap of 100 entries.
+ * Uses AbortController to cancel stale requests on rapid navigation.
+ * @param {string} topic - Help topic to fetch
+ * @param {string} marker - Optional marker to scroll to
+ * @param {string} host - Server host
+ * @param {number} port - Server port
+ * @param {boolean} isHistoryNav - True if navigating via back/forward (don't push to history)
+ */
+async function fetchAndShowHelp(topic, marker, host, port, isHistoryNav) {
+    // Cancel any in-flight help request to prevent stale responses
+    if (helpAbortController) {
+        helpAbortController.abort();
+    }
+    helpAbortController = new AbortController();
+    const currentController = helpAbortController;
+
+    try {
+        const response = await axios.get(
+            `http://${host}:${port}/help`,
+            {
+                params: { topic: topic, format: 'html' },
+                timeout: 30000,
+                responseType: 'text',
+                signal: currentController.signal
+            }
+        );
+
+        // Ignore if this request was cancelled (a newer one is in flight)
+        if (currentController.signal.aborted) return;
+
+        // Update history
+        if (!isHistoryNav) {
+            // Trim forward history when navigating to a new page
+            helpHistory = helpHistory.slice(0, helpHistoryIndex + 1);
+            helpHistory.push({ topic: topic, marker: marker || '' });
+            helpHistoryIndex = helpHistory.length - 1;
+            // Cap history at 100 entries
+            if (helpHistory.length > 100) {
+                helpHistory = helpHistory.slice(-100);
+                helpHistoryIndex = helpHistory.length - 1;
+            }
+        }
+
+        showStataHelp(topic, response.data, marker);
+    } catch (error) {
+        // Silently ignore cancelled requests
+        if (axios.isCancel && axios.isCancel(error)) return;
+        if (error.code === 'ERR_CANCELED' || error.name === 'CanceledError') return;
+
+        const rawErr = error.response && error.response.data ? error.response.data : error.message;
+        const errMsg = typeof rawErr === 'string' ? rawErr : JSON.stringify(rawErr);
+        vscode.window.showErrorMessage(`Failed to load help for "${topic}": ${errMsg}`);
+    }
+}
+
 async function executeStataCode(code, toolName = 'run_command', workingDir = null) {
     // Check if session is restarting
     if (isRestarting) {
@@ -1405,6 +1601,17 @@ async function executeStataCode(code, toolName = 'run_command', workingDir = nul
             vscode.window.showErrorMessage('Failed to connect to MCP server');
             return;
         }
+    }
+
+    // Intercept help commands before setting execution state — display in dedicated webview panel
+    const helpTopic = parseHelpCommand(code);
+    if (helpTopic) {
+        try {
+            await fetchAndShowHelp(helpTopic, '', host, port);
+        } catch (err) {
+            vscode.window.showErrorMessage(`Failed to load help: ${err.message}`);
+        }
+        return;
     }
 
     // Set execution state for status bar indicator

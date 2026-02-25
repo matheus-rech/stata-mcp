@@ -10,6 +10,7 @@ display ""
 clear
 set obs 100
 gen x = _n
+help scatter
 
 * Loop that will take a long time
 local iter = 70

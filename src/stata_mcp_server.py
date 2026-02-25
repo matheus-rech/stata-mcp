@@ -25,6 +25,7 @@ import re
 
 # Import utility functions
 from utils import get_windows_path_help_message, normalize_path_for_platform
+from smcl_parser import smcl_to_html
 
 # Import API models
 from api_models import (
@@ -3382,6 +3383,632 @@ async def restart_session():
             return {"status": "error", "message": str(e)}
         finally:
             _single_session_restart_lock.release()
+
+
+# Lock for single-session help requests to prevent concurrent Stata access
+_help_lock = threading.Lock()
+
+# Endpoint to serve Stata help text
+# Hidden from OpenAPI schema so it won't be exposed to LLMs via MCP
+@app.get("/help", include_in_schema=False)
+async def help_endpoint(topic: str, format: str = "text"):
+    """Retrieve Stata help file content for a given topic.
+
+    Uses findfile + type ..., starbang to extract clean plain text from .sthlp/.hlp files.
+    When format=html, reads raw .sthlp file and converts SMCL to HTML with links.
+    This endpoint is called by the VS Code extension only (not MCP tools).
+    """
+    global stata_available, stata, multi_session_enabled, session_manager
+
+    if not stata_available:
+        return Response(
+            content="Stata is not available",
+            status_code=503,
+            media_type="text/plain"
+        )
+
+    # Sanitize topic
+    original_topic = topic.strip()
+    topic = original_topic.lstrip('#').replace(' ', '_').split(',')[0].strip()
+
+    if not topic:
+        return Response(
+            content="No topic specified",
+            status_code=400,
+            media_type="text/plain"
+        )
+
+    # Validate topic: only allow alphanumeric, underscores, hyphens, and dots
+    # This prevents Stata code injection via backticks, quotes, newlines, etc.
+    if not re.match(r'^[a-zA-Z0-9_\-.]+$', topic):
+        return Response(
+            content="Invalid topic name",
+            status_code=400,
+            media_type="text/plain"
+        )
+
+    logging.info(f"Help requested for topic: {topic} (original: {original_topic}, format: {format})")
+
+    # ── HTML format: read raw .sthlp file and convert SMCL to HTML ──
+    if format == 'html':
+        return await _help_html(topic)
+
+    # ── Text format (default): use type ..., starbang ──
+
+    # Build Stata code to find and display help file
+    # Save and restore linesize to avoid side effects on the user's session
+    # Strategy: 1) findfile (standard adopath search)
+    #           2) Fallback: explicit search in sysdir subdirectories (fixes Windows PyStata)
+    first_letter = topic[0].lower() if topic else ''
+    stata_code = f'''set more off
+local _stata_help_old_linesize = c(linesize)
+set linesize 255
+local _helpfn ""
+capture findfile {topic}.sthlp
+if _rc == 0 local _helpfn "`r(fn)'"
+if "`_helpfn'" == "" {{
+    capture findfile {topic}.hlp
+    if _rc == 0 local _helpfn "`r(fn)'"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_base)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_base)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_base)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_base)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_plus)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_plus)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_plus)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_plus)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_site)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_site)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_site)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_site)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_personal)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_personal)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_personal)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_personal)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_stata)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_stata)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_stata)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_stata)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_oldplace)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_oldplace)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_oldplace)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_oldplace)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" != "" {{
+    type "`_helpfn'", starbang
+}}
+else {{
+    display as error "help file not found for: {topic}"
+}}
+set linesize `_stata_help_old_linesize\'
+'''
+
+    try:
+        def _run_help():
+            """Run help lookup in a thread-safe way"""
+            # Create a temp do file — open fd immediately to prevent leak
+            fd, temp_file = tempfile.mkstemp(suffix='.do', prefix='stata_help_')
+            log_file = None
+            fd_consumed = False
+            try:
+                # Determine log file path first so it's available in finally
+                base_name = os.path.splitext(os.path.basename(temp_file))[0]
+                log_file = get_log_file_path(temp_file, base_name)
+                log_file_stata = log_file.replace('\\', '/')
+
+                # Ensure log directory exists
+                log_dir = os.path.dirname(log_file)
+                if log_dir:
+                    try:
+                        os.makedirs(log_dir, exist_ok=True)
+                    except OSError as e:
+                        # Fallback: use temp directory if log dir creation fails (e.g., protected path on Windows)
+                        logging.warning(f"Help: could not create log dir {log_dir}: {e}, falling back to temp dir")
+                        log_file = os.path.join(tempfile.gettempdir(), f"{base_name}_mcp.log")
+                        log_file_stata = log_file.replace('\\', '/')
+
+                # Write do file content
+                # For multi-session mode: write only the stata_code (worker adds its own log wrapper)
+                # For single-session mode: wrap with log using/close to capture output
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    fd_consumed = True
+                    if multi_session_enabled and session_manager is not None:
+                        f.write(stata_code)
+                    else:
+                        f.write(f'capture log close _stata_help_log\n')
+                        f.write(f'log using "{log_file_stata}", replace text name(_stata_help_log)\n')
+                        f.write(stata_code)
+                        f.write(f'\ncapture log close _stata_help_log\n')
+
+                # Run via Stata
+                # Convert temp_file to forward slashes for Stata compatibility on Windows
+                temp_file_stata = temp_file.replace('\\', '/')
+                logging.debug(f"Help: temp_file={temp_file}, log_file={log_file}")
+
+                if multi_session_enabled and session_manager is not None:
+                    result_dict = session_manager.execute_file(
+                        temp_file,
+                        session_id=None,
+                        timeout=30.0,
+                        log_file=log_file
+                    )
+                    if result_dict.get('status') == 'success':
+                        raw_output = result_dict.get('output', '')
+                        logging.debug(f"Help: multi-session output length={len(raw_output)}")
+                    else:
+                        raise RuntimeError(result_dict.get('error', 'Unknown error'))
+                else:
+                    # Acquire lock to prevent concurrent single-session Stata access
+                    if not _help_lock.acquire(timeout=30):
+                        raise TimeoutError("Help request timed out waiting for Stata")
+                    try:
+                        stata.run(f'do "{temp_file_stata}"', inline=False, echo=False)
+                    finally:
+                        _help_lock.release()
+                    # Read from log file
+                    raw_output = ''
+                    if os.path.exists(log_file):
+                        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                            raw_output = f.read()
+                        logging.debug(f"Help: single-session log output length={len(raw_output)}")
+                    else:
+                        logging.warning(f"Help: log file not found at {log_file}")
+
+                return raw_output
+            finally:
+                # Close fd if os.fdopen was never reached
+                if not fd_consumed:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                # Cleanup temp files (retry on Windows where file locking may delay release)
+                for f_path in [temp_file, log_file]:
+                    if f_path is None:
+                        continue
+                    for attempt in range(3):
+                        try:
+                            if os.path.exists(f_path):
+                                os.unlink(f_path)
+                            break
+                        except PermissionError:
+                            if attempt < 2:
+                                time.sleep(0.2)
+                            else:
+                                logging.debug(f"Help: could not delete temp file {f_path} (file locked)")
+                        except Exception:
+                            break
+
+        raw_output = await asyncio.to_thread(_run_help)
+
+        if not raw_output or not raw_output.strip():
+            logging.warning(f"Help: empty raw output for topic '{topic}'")
+            return Response(
+                content=f"No help content found for: {topic}",
+                status_code=404,
+                media_type="text/plain"
+            )
+
+        # Normalize line endings (Windows Stata produces \r\n)
+        raw_output = raw_output.replace('\r\n', '\n').replace('\r', '\n')
+
+        # Clean up the output: remove log header/footer and command echo lines
+        # Strategy: Use a state machine with three phases:
+        #   1. HEADER: skip log preamble lines until we see the first findfile echo
+        #   2. PREAMBLE: skip our .do file command echoes (known finite set)
+        #   3. CONTENT: keep everything except log footer lines
+        # This avoids stripping legitimate help content that matches echo patterns.
+        lines = raw_output.split('\n')
+        cleaned_lines = []
+        phase = 'header'  # header -> preamble -> content
+        for line in lines:
+            stripped = line.strip()
+            stripped_lower = stripped.lower()
+
+            if phase == 'header':
+                # Skip log header lines (dashes, log metadata, etc.)
+                if re.match(r'^-{5,}$', stripped):
+                    continue
+                if stripped_lower.startswith('log:') or stripped_lower.startswith('log type:') or stripped_lower.startswith('opened on:') or stripped_lower.startswith('name:'):
+                    continue
+                # Skip continuation lines from log metadata (wrapped long paths)
+                if stripped.startswith('>'):
+                    continue
+                # Skip command echo lines before the actual help code
+                if stripped.startswith('.') and stripped_lower != '.':
+                    # Once we see the findfile echo, switch to preamble phase
+                    if 'findfile' in line:
+                        phase = 'preamble'
+                    continue
+                # Skip empty lines in header
+                if not stripped:
+                    continue
+                # Non-matching non-empty line: transition to content
+                phase = 'content'
+
+            elif phase == 'preamble':
+                # Skip our .do file command echo lines (they come in a known sequence)
+                # These are the Stata echoes of: if _rc, type, }, else {, display, }, set linesize
+                if stripped.startswith('.') or stripped.startswith('>'):
+                    continue
+                # Skip empty lines between echo blocks
+                if not stripped:
+                    continue
+                # First non-echo, non-empty line = start of actual help content
+                phase = 'content'
+
+            # phase == 'content': keep lines except log footer
+            if phase == 'content':
+                # Skip log footer lines
+                if re.match(r'^-{5,}$', stripped):
+                    continue
+                if stripped_lower.startswith('name:') and '_stata_help_log' in stripped_lower:
+                    continue
+                if stripped_lower.startswith('log type:') or stripped_lower.startswith('closed on:'):
+                    continue
+                if stripped_lower.startswith('log:') and '_stata_help' in stripped_lower:
+                    continue
+                # Skip the linesize restore echo and other trailing command echoes
+                if stripped.startswith('. set linesize') or stripped.startswith('. capture log close'):
+                    continue
+                # Skip echoes from if/else block endings (Stata logs both branches)
+                # Use regex to handle variable indentation (e.g. ".     display" vs ". display")
+                if re.match(r'^\.\s*(}|else\s*\{)', stripped):
+                    continue
+                if re.match(r'^\.\s+display\s+as\s+error\s+"help file not found', stripped):
+                    continue
+                if stripped == '.':
+                    continue
+
+                cleaned_lines.append(line)
+
+        # Remove trailing empty lines
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+
+        help_text = '\n'.join(cleaned_lines)
+
+        if not help_text.strip():
+            logging.warning(f"Help: raw output had {len(lines)} lines but all were filtered out for topic '{topic}'")
+            logging.debug(f"Help: first 10 raw lines: {lines[:10]}")
+            return Response(
+                content=f"No help content found for: {topic}",
+                status_code=404,
+                media_type="text/plain"
+            )
+
+        # Check if the output contains the "not found" error
+        # Use exact line match (not substring) to avoid matching Stata command echoes
+        # like `. display as error "help file not found for: regress"` which appear
+        # in logs even when the else branch didn't execute
+        not_found_msg = f"help file not found for: {topic}"
+        if any(line.strip() == not_found_msg for line in cleaned_lines):
+            return Response(
+                content=f"Help file not found for: {topic}",
+                status_code=404,
+                media_type="text/plain"
+            )
+
+        return Response(
+            content=help_text,
+            media_type="text/plain"
+        )
+
+    except TimeoutError:
+        return Response(
+            content="Help request timed out waiting for Stata",
+            status_code=503,
+            media_type="text/plain"
+        )
+    except Exception as e:
+        logging.error(f"Error fetching help for {topic}: {str(e)}")
+        return Response(
+            content=f"Error fetching help: {str(e)}",
+            status_code=500,
+            media_type="text/plain"
+        )
+
+
+async def _help_html(topic: str):
+    """Serve help as rendered HTML by reading raw .sthlp file and converting SMCL.
+
+    Steps:
+    1. Run Stata to find the file path and get sysdir paths
+    2. Read the raw .sthlp file in Python
+    3. Resolve INCLUDE directives
+    4. Convert SMCL to HTML via smcl_parser
+    5. Return HTML
+    """
+    global stata_available, stata, multi_session_enabled, session_manager
+
+    first_letter = topic[0].lower() if topic else ''
+
+    # Stata code to find the help file and output its path + sysdir paths
+    stata_code_find = f'''set more off
+local _helpfn ""
+capture findfile {topic}.sthlp
+if _rc == 0 local _helpfn "`r(fn)'"
+if "`_helpfn'" == "" {{
+    capture findfile {topic}.hlp
+    if _rc == 0 local _helpfn "`r(fn)'"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_base)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_base)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_base)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_base)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_plus)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_plus)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_plus)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_plus)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_site)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_site)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_site)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_site)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_personal)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_personal)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_personal)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_personal)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_stata)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_stata)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_stata)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_stata)'{first_letter}/{topic}.hlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_oldplace)'{first_letter}/{topic}.sthlp"
+    if _rc == 0 local _helpfn "`c(sysdir_oldplace)'{first_letter}/{topic}.sthlp"
+}}
+if "`_helpfn'" == "" {{
+    capture confirm file "`c(sysdir_oldplace)'{first_letter}/{topic}.hlp"
+    if _rc == 0 local _helpfn "`c(sysdir_oldplace)'{first_letter}/{topic}.hlp"
+}}
+local _old_ls = c(linesize)
+set linesize 255
+if "`_helpfn'" != "" {{
+    display "STATA_HELP_FILE: `_helpfn'"
+    display "STATA_SYSDIR_BASE: `c(sysdir_base)'"
+    display "STATA_SYSDIR_PLUS: `c(sysdir_plus)'"
+    display "STATA_SYSDIR_SITE: `c(sysdir_site)'"
+    display "STATA_SYSDIR_PERSONAL: `c(sysdir_personal)'"
+    display "STATA_SYSDIR_STATA: `c(sysdir_stata)'"
+    display "STATA_SYSDIR_OLDPLACE: `c(sysdir_oldplace)'"
+}}
+set linesize `_old_ls'
+else {{
+    display as error "help file not found for: {topic}"
+}}
+'''
+
+    try:
+        def _run_find():
+            """Run the find command to get file path and sysdir paths."""
+            fd, temp_file = tempfile.mkstemp(suffix='.do', prefix='stata_help_find_')
+            log_file = None
+            fd_consumed = False
+            try:
+                base_name = os.path.splitext(os.path.basename(temp_file))[0]
+                log_file = get_log_file_path(temp_file, base_name)
+                log_file_stata = log_file.replace('\\', '/')
+                log_dir = os.path.dirname(log_file)
+                if log_dir:
+                    try:
+                        os.makedirs(log_dir, exist_ok=True)
+                    except OSError:
+                        log_file = os.path.join(tempfile.gettempdir(), f"{base_name}_mcp.log")
+                        log_file_stata = log_file.replace('\\', '/')
+
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    fd_consumed = True
+                    if multi_session_enabled and session_manager is not None:
+                        f.write(stata_code_find)
+                    else:
+                        f.write(f'capture log close _stata_help_log\n')
+                        f.write(f'log using "{log_file_stata}", replace text name(_stata_help_log)\n')
+                        f.write(stata_code_find)
+                        f.write(f'\ncapture log close _stata_help_log\n')
+
+                temp_file_stata = temp_file.replace('\\', '/')
+                if multi_session_enabled and session_manager is not None:
+                    result_dict = session_manager.execute_file(
+                        temp_file, session_id=None, timeout=30.0, log_file=log_file
+                    )
+                    if result_dict.get('status') == 'success':
+                        return result_dict.get('output', '')
+                    raise RuntimeError(result_dict.get('error', 'Unknown error'))
+                else:
+                    if not _help_lock.acquire(timeout=30):
+                        raise TimeoutError("Help request timed out waiting for Stata")
+                    try:
+                        stata.run(f'do "{temp_file_stata}"', inline=False, echo=False)
+                    finally:
+                        _help_lock.release()
+                    if os.path.exists(log_file):
+                        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                            return f.read()
+                    return ''
+            finally:
+                if not fd_consumed:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                for f_path in [temp_file, log_file]:
+                    if f_path is None:
+                        continue
+                    for attempt in range(3):
+                        try:
+                            if os.path.exists(f_path):
+                                os.unlink(f_path)
+                            break
+                        except PermissionError:
+                            if attempt < 2:
+                                time.sleep(0.2)
+                            else:
+                                logging.debug(f"Help HTML: could not delete temp file {f_path} (file locked)")
+                        except Exception:
+                            break
+
+        raw_output = await asyncio.to_thread(_run_find)
+        raw_output = raw_output.replace('\r\n', '\n').replace('\r', '\n')
+
+        # Parse the output to extract file path and sysdir paths
+        # Join continuation lines (Stata wraps long display output with '>' prefix)
+        raw_lines = raw_output.split('\n')
+        joined_lines = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped.startswith('>') and joined_lines:
+                # Continuation of previous line — append without the '>' prefix
+                joined_lines[-1] = joined_lines[-1] + stripped[1:].lstrip()
+            else:
+                joined_lines.append(stripped)
+
+        help_file_path = None
+        sysdir_paths = []
+        not_found_msg = f"help file not found for: {topic}"
+        for stripped in joined_lines:
+            if stripped.startswith('STATA_HELP_FILE:'):
+                help_file_path = stripped[len('STATA_HELP_FILE:'):].strip().strip('"').strip("'")
+            elif stripped.startswith('STATA_SYSDIR_'):
+                # Extract sysdir path
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'") if ':' in stripped else ''
+                if val:
+                    sysdir_paths.append(val)
+            elif stripped == not_found_msg:
+                return Response(
+                    content=f"Help file not found for: {topic}",
+                    status_code=404,
+                    media_type="text/plain"
+                )
+
+        if not help_file_path:
+            logging.warning(f"Help HTML: could not find help file path in Stata output for '{topic}'")
+            return Response(
+                content=f"Help file not found for: {topic}",
+                status_code=404,
+                media_type="text/plain"
+            )
+
+        logging.debug(f"Help HTML: file={help_file_path}, sysdirs={sysdir_paths}")
+
+        # Read the raw .sthlp file
+        if not os.path.exists(help_file_path):
+            return Response(
+                content=f"Help file not found at path: {help_file_path}",
+                status_code=404,
+                media_type="text/plain"
+            )
+
+        with open(help_file_path, 'r', encoding='utf-8', errors='replace') as f:
+            raw_smcl = f.read()
+
+        # Build include resolver using sysdir paths
+        def include_resolver(include_name):
+            """Find and read an INCLUDE help file (.ihlp)."""
+            if not include_name:
+                return None
+            first_ch = include_name[0].lower()
+            # Search in all sysdir paths
+            for sysdir in sysdir_paths:
+                candidate = os.path.join(sysdir, first_ch, f'{include_name}.ihlp')
+                if os.path.exists(candidate):
+                    try:
+                        with open(candidate, 'r', encoding='utf-8', errors='replace') as f:
+                            return f.read()
+                    except PermissionError:
+                        logging.warning(f"Help HTML: permission denied reading include '{candidate}'")
+                    except Exception as e:
+                        logging.debug(f"Help HTML: error reading include '{candidate}': {e}")
+            # Also try the same directory as the main help file
+            help_dir = os.path.dirname(help_file_path)
+            candidate = os.path.join(help_dir, f'{include_name}.ihlp')
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, 'r', encoding='utf-8', errors='replace') as f:
+                        return f.read()
+                except PermissionError:
+                    logging.warning(f"Help HTML: permission denied reading include '{candidate}'")
+                except Exception as e:
+                    logging.debug(f"Help HTML: error reading include '{candidate}': {e}")
+            # Try with first-letter subdirectory relative to help file's parent
+            parent_dir = os.path.dirname(help_dir)
+            if parent_dir:
+                candidate = os.path.join(parent_dir, first_ch, f'{include_name}.ihlp')
+                if os.path.exists(candidate):
+                    try:
+                        with open(candidate, 'r', encoding='utf-8', errors='replace') as f:
+                            return f.read()
+                    except PermissionError:
+                        logging.warning(f"Help HTML: permission denied reading include '{candidate}'")
+                    except Exception as e:
+                        logging.debug(f"Help HTML: error reading include '{candidate}': {e}")
+            logging.debug(f"Help HTML: include '{include_name}' not found")
+            return None
+
+        # Convert SMCL to HTML
+        html_content = smcl_to_html(raw_smcl, include_resolver=include_resolver, topic=topic)
+
+        return Response(
+            content=html_content,
+            media_type="text/html"
+        )
+
+    except TimeoutError:
+        return Response(
+            content="Help request timed out waiting for Stata",
+            status_code=503,
+            media_type="text/plain"
+        )
+    except Exception as e:
+        logging.error(f"Error fetching HTML help for {topic}: {str(e)}")
+        logging.debug(traceback.format_exc())
+        return Response(
+            content=f"Error fetching help: {str(e)}",
+            status_code=500,
+            media_type="text/plain"
+        )
 
 
 # Endpoint to serve graph images

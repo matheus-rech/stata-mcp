@@ -8,6 +8,7 @@ src/**
 !src/api_models.py
 !src/output_filter.py
 !src/utils.py
+!src/smcl_parser.py
 !src/requirements.txt
 !src/check-python.js
 !src/start-server.js

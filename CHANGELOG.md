@@ -2,6 +2,27 @@
 
 All notable changes to the Stata MCP extension will be documented in this file.
 
+## [0.4.9] - 2026-02-25
+
+### Added
+- **Help Command Support**: Stata `help` commands now display content in a dedicated webview panel (Issue #55)
+  - Type `help regress`, `man logit`, etc. in Run Selection or Interactive Window
+  - Help content is displayed in a clean, readable "Stata Help" panel alongside your code
+  - Supports `help`, `man`, `chelp`, and `whelp` commands
+  - Handles multi-word topics (e.g., `help regress postestimation`), `#`-prefixed topics, and options
+  - Panel is reused across help requests — subsequent `help` calls update the same panel
+  - MCP tool calls (AI agents) are NOT affected — they bypass the help interception entirely
+- **Rich SMCL Rendering**: Help files are now rendered with full formatting, matching Stata's native Viewer
+  - Bold, italic, command styling with proper fonts and colors
+  - Clickable links: click any `{help topic}` reference to navigate to that help page
+  - Back/Forward navigation with history (like a browser)
+  - Table of contents from `{viewerjumpto}` entries for quick section navigation
+  - "Also see" section with clickable links to related topics
+  - Synopt tables rendered as proper HTML tables
+  - INCLUDE directive resolution for complete help content
+  - Special character support (`{c ...}`) for accents, line-drawing, etc.
+  - VS Code theme-aware styling (works with light and dark themes)
+
 ## [0.4.8] - 2026-02-24
 
 ### Fixed
